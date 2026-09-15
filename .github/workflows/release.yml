@@ -1,0 +1,188 @@
+name: Build and release 3DS executables
+
+# Triggers:
+#   - Pushing a version tag (v*.*.*) builds all three games and publishes a
+#     GitHub Release named after the tag.
+#   - Manual dispatch always builds; it only publishes a Release if a
+#     `release_tag` is supplied, so it can also be used as a dry-run build.
+on:
+  push:
+    tags:
+      - "v*.*.*"
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: >-
+          Publish a GitHub Release under this tag (e.g. v1.2.0) once the build
+          finishes. Leave empty to just build and upload workflow artifacts.
+        required: false
+        default: ""
+
+env:
+  # Pinned to the devkitPro/buildscripts tag for devkitARM release 55
+  # (GCC 10.2.0 / binutils 2.34 / newlib 3.3.0). All three game trees refuse
+  # to build against any other devkitARM at ../../toolchains/devkitARM
+  # (see III/build/GNUmakefile, miami/build/GNUmakefile, stories/build/GNUmakefile) -
+  # a newer compiler can link a 3DSX that still crashes on real hardware.
+  DEVKITARM_R55_CACHE_KEY: devkitarm-r55-gcc10.2.0-binutils2.34-newlib3.3.0-linux
+
+jobs:
+  # Builds the exact devkitARM r55 cross-compiler from source (there is no
+  # docker/pacman package for it any more) and caches it. Later runs restore
+  # the cache in seconds instead of rebuilding a full GCC cross-toolchain.
+  toolchain:
+    name: Build pinned devkitARM r55 toolchain
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Prepare toolchain directory
+        run: mkdir -p "$GITHUB_WORKSPACE/toolchains"
+
+      - name: Cache devkitARM r55 toolchain
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/devkitARM
+          key: ${{ env.DEVKITARM_R55_CACHE_KEY }}
+
+      - name: Install host build dependencies
+        if: steps.cache.outputs.cache-hit != 'true'
+        env:
+          DEBIAN_FRONTEND: noninteractive
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential texinfo bison flex gperf gawk \
+            libgmp-dev libmpfr-dev libmpc-dev libisl-dev zlib1g-dev \
+            python3 patch file curl wget bzip2 xz-utils ca-certificates git
+
+      - name: Fetch devkitPro buildscripts (devkitARM_r55)
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch devkitARM_r55 --depth 1 \
+            https://github.com/devkitPro/buildscripts.git "$RUNNER_TEMP/buildscripts"
+
+      - name: Build devkitARM r55 from source
+        if: steps.cache.outputs.cache-hit != 'true'
+        working-directory: ${{ runner.temp }}/buildscripts
+        run: |
+          {
+            echo "BUILD_DKPRO_PACKAGE=1"
+            echo "BUILD_DKPRO_INSTALLDIR=$GITHUB_WORKSPACE/toolchains"
+            echo "BUILD_DKPRO_AUTOMATED=1"
+            echo 'numcores=$(nproc)'
+            echo 'export MAKEFLAGS="-j${numcores}"'
+          } > config.sh
+          chmod +x build-devkit.sh
+          ./build-devkit.sh
+
+      - name: Verify the built toolchain is really r55
+        if: steps.cache.outputs.cache-hit != 'true'
+        run: |
+          version=$("$GITHUB_WORKSPACE/toolchains/devkitARM/bin/arm-none-eabi-g++" --version | head -n1)
+          echo "$version"
+          case "$version" in
+            *" 10.2.0"*) ;;
+            *) echo "::error::Built compiler is not GCC 10.2.0 (devkitARM r55): $version"; exit 1 ;;
+          esac
+          test -f "$GITHUB_WORKSPACE/toolchains/devkitARM/3ds_rules" || {
+            echo "::error::3ds_rules is missing from the built toolchain"
+            exit 1
+          }
+
+  build:
+    name: Build and package re3 / reVC / reLCS
+    needs: toolchain
+    runs-on: ubuntu-latest
+    # devkitpro/devkitarm bundles devkitPro's host tools, portlibs, 3dstools
+    # and general-tools (bannertool/makerom) - everything except the pinned
+    # r55 compiler itself, which is restored from cache below.
+    container:
+      image: devkitpro/devkitarm:latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Restore devkitARM r55 toolchain
+        id: cache
+        uses: actions/cache@v4
+        with:
+          path: toolchains/devkitARM
+          key: ${{ env.DEVKITARM_R55_CACHE_KEY }}
+
+      - name: Verify toolchain was restored
+        run: |
+          if [ "${{ steps.cache.outputs.cache-hit }}" != "true" ]; then
+            echo "::error::Pinned devkitARM r55 toolchain cache was not found; the toolchain job must succeed first."
+            exit 1
+          fi
+          test -x toolchains/devkitARM/bin/arm-none-eabi-g++
+
+      - name: Install packaging dependencies
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends zsh perl
+          command -v shasum >/dev/null || { echo "::error::shasum is required by packaging/production_cia/build_production.sh"; exit 1; }
+          dkp-pacman -Syyu --noconfirm
+          dkp-pacman -S --needed --noconfirm general-tools 3dstools
+
+      - name: Verify shared dependency layout
+        run: sh scripts/verify-layout.sh
+
+      - name: Build re3, reVC and reLCS
+        env:
+          DEVKITARM: ${{ github.workspace }}/toolchains/devkitARM
+        run: sh scripts/build.sh all
+
+      - name: Package production CIAs
+        run: zsh packaging/production_cia/build_production.sh
+
+      - name: Stage release files
+        run: |
+          set -eu
+          mkdir -p dist
+          cp III/build/re3.3dsx dist/re3.3dsx
+          cp miami/build/miami.3dsx dist/revc.3dsx
+          cp stories/build/relcs.3dsx dist/relcs.3dsx
+          cp packaging/production_cia/output/*.cia dist/
+          cp packaging/production_cia/output/*.3dsx dist/
+          ( cd dist && sha256sum -- * > SHA256SUMS.txt )
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: regta-3ds-executables
+          path: dist/
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+    if: (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/')) || (github.event_name == 'workflow_dispatch' && inputs.release_tag != '')
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: regta-3ds-executables
+          path: dist
+
+      - name: Determine release tag
+        id: tag
+        run: |
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            echo "tag=${{ inputs.release_tag }}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=${{ github.ref_name }}" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Publish release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: ${{ steps.tag.outputs.tag }}
+          generate_release_notes: true
+          files: dist/*
