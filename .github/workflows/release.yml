@@ -73,6 +73,10 @@ jobs:
             echo 'numcores=$(nproc)'
             echo 'export MAKEFLAGS="-j${numcores}"'
           } > config.sh
+          # downloads.devkitpro.org sits behind Cloudflare and 403s curl's
+          # default User-Agent; build-devkit.sh hardcodes plain `curl -f -L -O`,
+          # so give it a browser-like UA via .curlrc instead.
+          echo 'user-agent = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"' > "$HOME/.curlrc"
           chmod +x build-devkit.sh
           ./build-devkit.sh
 
